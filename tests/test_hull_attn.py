@@ -234,6 +234,31 @@ def test_hull_attn_topk_rejects_autograd():
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_width_matched_benchmark_shapes_smoke(dtype):
+    sdpa_shape = (64, 8, 2048, 16)
+    hull_shape = (64, 64, 2048, 2)
+    device = "cuda"
+
+    q_sdpa = torch.randn(sdpa_shape, device=device, dtype=dtype).contiguous()
+    k_sdpa = torch.randn_like(q_sdpa)
+    v_sdpa = torch.randn_like(q_sdpa)
+    out_sdpa = torch.nn.functional.scaled_dot_product_attention(
+        q_sdpa, k_sdpa, v_sdpa, attn_mask=None, dropout_p=0.0, is_causal=False
+    )
+
+    q_hull = torch.randn(hull_shape, device=device, dtype=dtype).contiguous()
+    k_hull = torch.randn_like(q_hull)
+    v_hull = torch.randn_like(q_hull)
+    seq_lens = torch.full((hull_shape[0],), hull_shape[2], device=device, dtype=torch.int32)
+    out_hull = hull_attn(q_hull, k_hull, v_hull, mode="full", seq_lens=seq_lens)
+
+    assert out_sdpa.shape == sdpa_shape
+    assert out_hull.shape == hull_shape
+    assert torch.isfinite(out_sdpa).all()
+    assert torch.isfinite(out_hull).all()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hull_attn_full_forces_cute_forward(dtype):
     atol, rtol = CUTE_TOLERANCES[dtype]
     q = torch.randn((1, 2, 32, 2), device="cuda", dtype=dtype)

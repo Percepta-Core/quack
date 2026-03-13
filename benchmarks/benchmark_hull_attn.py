@@ -100,6 +100,7 @@ def _format_result(name: str, result):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", choices=["width-matched", "single"], default="width-matched")
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--heads", type=int, default=64)
     parser.add_argument("--seqlen", type=int, default=512)
@@ -114,12 +115,72 @@ def main():
     parser.add_argument("--backward", action="store_true")
     args = parser.parse_args()
 
-    if args.head_dim != 2:
-        raise ValueError("This benchmark targets hull_attn head_dim=2")
-
     dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
     device = "cuda"
+    benchmark_fn = _benchmark_cuda_memory if args.measure_memory else _benchmark_cuda
     torch.manual_seed(0)
+
+    if args.scenario == "width-matched":
+        if args.backward:
+            raise ValueError("width-matched scenario is forward-only")
+        if args.mode != "full":
+            raise ValueError("width-matched scenario benchmarks full attention only")
+        if args.mask:
+            raise ValueError("width-matched scenario expects seq_lens or unmasked inputs, not dense masks")
+
+        batch = args.batch
+        seqlen = args.seqlen
+        sdpa_shape = (batch, 8, seqlen, 16)
+        hull_shape = (batch, 64, seqlen, 2)
+        seq_lens = None
+        if args.seq_lens:
+            seq_lens = torch.linspace(seqlen, max(seqlen // 4, 1), batch, device=device)
+            seq_lens = seq_lens.round().to(dtype=torch.int32)
+
+        q_sdpa = torch.randn(sdpa_shape, device=device, dtype=dtype).contiguous()
+        k_sdpa = torch.randn_like(q_sdpa)
+        v_sdpa = torch.randn_like(q_sdpa)
+        q_hull = torch.randn(hull_shape, device=device, dtype=dtype).contiguous()
+        k_hull = torch.randn_like(q_hull)
+        v_hull = torch.randn_like(q_hull)
+
+        sdpa_mask = None
+        if seq_lens is not None:
+            key_padding_mask = torch.arange(seqlen, device=device)[None, :] < seq_lens[:, None]
+            sdpa_mask = key_padding_mask[:, None, None, :]
+
+        results = {
+            "pytorch_sdpa": benchmark_fn(
+                lambda: F.scaled_dot_product_attention(
+                    q_sdpa, k_sdpa, v_sdpa, attn_mask=sdpa_mask, dropout_p=0.0, is_causal=False
+                ),
+                warmup=args.warmup,
+                iters=args.iters,
+            ),
+            "quack_hull": benchmark_fn(
+                lambda: hull_attn(q_hull, k_hull, v_hull, mode="full", seq_lens=seq_lens),
+                warmup=args.warmup,
+                iters=args.iters,
+            ),
+        }
+        if isinstance(results["pytorch_sdpa"], dict) and isinstance(results["quack_hull"], dict):
+            results["ratio"] = (
+                f"{results['quack_hull']['mean_ms'] / results['pytorch_sdpa']['mean_ms']:.2f}x "
+                "slower (hull / sdpa)"
+            )
+
+        print(
+            f"scenario=width-matched batch={batch} seqlen={seqlen} dtype={dtype} "
+            f"sdpa_shape={sdpa_shape} hull_shape={hull_shape} seq_lens={args.seq_lens} "
+            f"measure_memory={args.measure_memory}"
+        )
+        for name, result in results.items():
+            print(_format_result(name, result))
+        return
+
+    if args.head_dim != 2:
+        raise ValueError("single scenario targets hull_attn head_dim=2")
+
     q = torch.randn((args.batch, args.heads, args.seqlen, 2), device=device, dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
@@ -134,7 +195,6 @@ def main():
         seq_lens = seq_lens.round().to(dtype=torch.int32)
 
     results = {}
-    benchmark_fn = _benchmark_cuda_memory if args.measure_memory else _benchmark_cuda
 
     def quack_cute_run():
         if args.backward:
@@ -268,7 +328,7 @@ def main():
             )
 
     print(
-        f"batch={args.batch} heads={args.heads} seqlen={args.seqlen} "
+        f"scenario=single batch={args.batch} heads={args.heads} seqlen={args.seqlen} "
         f"head_dim={args.head_dim} dtype={dtype} mode={args.mode} mask={args.mask} seq_lens={args.seq_lens} "
         f"backward={args.backward} measure_memory={args.measure_memory}"
     )
