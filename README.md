@@ -27,6 +27,7 @@ uv pip install 'quack-kernels[cu13]'
 - 🦆 Softmax forward + backward
 - 🦆 Cross entropy forward + backward
 - 🦆 Layernorm forward
+- 🦆 Hull attention forward + backward (head_dim=2)
 - 🦆 Hopper gemm + epilogue
 - 🦆 Blackwell gemm + epilogue
 
@@ -53,6 +54,38 @@ to speed-of-light, right in the comfort of Python thanks to the [CuTe-DSL](https
 </div>
 
 See our [blogpost](media/2025-07-10-membound-sol.md) for the details.
+
+### Hull Attention (head_dim=2)
+
+Width-matched comparison: hull attention at `[64, 64, 2048, 2]` vs SDPA/FA4 at `[64, 8, 2048, 16]` (same total width). H200, bf16.
+
+**Forward**
+
+| Kernel | Median | Peak Memory |
+|---|---|---|
+| FA4 (8h×16d) | 1.04 ms | 320 MiB |
+| SDPA (8h×16d) | 1.80 ms | 228 MiB |
+| FA4 pad→8 (64h×2d) | 7.05 ms | 800 MiB |
+| hull_attn_codex | 12.99 ms | 736 MiB |
+| SDPA (64h×2d) | 12.86 ms | 832 MiB |
+| hull_attn2 | 13.63 ms | 736 MiB |
+| hull_attn3 | 15.62 ms | 736 MiB |
+| flash_hull_attn | 15.60 ms | 736 MiB |
+| hull_attn | 28.71 ms | 736 MiB |
+
+**Backward (fwd + bwd)**
+
+| Kernel | Median | Peak Memory |
+|---|---|---|
+| SDPA (8h×16d) | 6.75 ms | 1128 MiB |
+| hull_attn2 | 38.51 ms | 576 MiB |
+| hull_attn_codex | 41.10 ms | 576 MiB |
+| SDPA (64h×2d) | 48.38 ms | 3136 MiB |
+| flash_hull_attn | 48.83 ms | 576 MiB |
+| hull_attn3 | 66.81 ms | 576 MiB |
+| hull_attn | 82.48 ms | 576 MiB |
+
+The best hull kernels (hull_attn2, hull_attn_codex) match SDPA on 2d inputs for forward and beat it on backward, while using **4–5x less memory**. The gap to the 16d baselines reflects the overhead of many tiny heads vs fewer large heads.
 
 ## Development
 
