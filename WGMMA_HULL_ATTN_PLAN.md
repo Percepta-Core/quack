@@ -392,17 +392,125 @@ Use `ncu` or equivalent to confirm:
 4. Is there a clean way to reuse FA4 load/store helpers without inheriting too much generic logic?
 
 
+## Implementation Status (2026-03-17)
+
+A prototype kernel exists at `quack/hull_attn_wgmma.py`. Current status:
+
+### What works
+
+- **Grouped-head WGMMA for QK scores:** Compiles and runs on SM90. Selector-packed Q_sel is
+  constructed in WGMMA-swizzled shared memory. K_pack is TMA-loaded with double-buffered pipeline.
+  The WGMMA produces correct per-head dot products (verified with peaked-attention tests, V=1,
+  V=head_idx, and Q=0 diagnostics).
+- **Online softmax:** Reuses FA4's `Softmax` class. Numerically correct.
+- **Host-side packing:** K and V are packed from `[B, H, S, 2]` to `[B*H//8, S, 16]` on the host.
+  Packing is verified correct.
+
+### What does not work: P@V
+
+The scalar P@V has a **layout mismatch** between the WGMMA accumulator and the CuTe identity
+tensor used to map accumulator elements to key positions.
+
+**Root cause:** `partition_C(identity_tensor)` and `make_rmem_tensor(partition_shape_C(...))` produce
+tensors with the same shape but different internal strides. After `reshape_acc_to_mn`, element `(r,c)`
+in the accumulator's M,N view maps to a different flat register than element `(r,c)` in the identity
+tensor's M,N view. So the N-index (key position) read from the identity tensor does not correspond to
+the score at the same `(r,c)` position. The V read goes to the wrong key position.
+
+This was confirmed by diagnostic tests:
+- V=1 (constant): correct (scores sum to 1 regardless of position mapping)
+- V varies by head only: correct (head mapping is in the M-dimension, which is consistent)
+- V varies by key position: **wrong** (N-dimension mapping is inconsistent)
+- Peaked attention at key=0: correct (position 0 happens to be mapped correctly)
+- Peaked attention at key>0: **wrong** (output ≈ 1/64, the uniform mean)
+
+### Why WGMMA P@V also does not work
+
+A second WGMMA for P@V (the FA4 approach: `P[M,N] @ V^T[D,N]^T → O[M,D]`) was attempted but
+fails for a different reason: the `D_PACKED=16` dimension is too small.
+
+With M=64, N_pv=D_PACKED=16, K_pv=TILE_N=64:
+- The MMA atom is `m64n8k16`, requiring 4 K-tiles across K_pv=64
+- V is TMA-loaded as `[TILE_N=64, D_PACKED=16]` row-major with a swizzle designed for that shape
+  (`S<1,2,3>` for 16-wide rows)
+- `transpose_view(sV)` creates `[16, 64]` by remapping dimensions, but the underlying 16-wide
+  swizzle is incompatible with the WGMMA B-operand access pattern across 4 K-tiles of width 16
+- All K-tiles end up reading from approximately the same smem locations
+
+In FA4 this works because `tile_hdimv >= 64`: both tile dimensions are large enough that the 128B
+swizzle (`S<3,4,3>`) is symmetric under `transpose_view`. At `D_PACKED=16` the swizzle breaks.
+
+### Paths forward
+
+**Option A: Fix the scalar P@V layout mismatch.**
+
+The identity tensor and accumulator have different flat-to-logical mappings. Possible fixes:
+1. Iterate in flat order over both `acc_S[i]` and `tScS[i]` (guaranteed same element), but the
+   softmax writes through `reshape_acc_to_mn` which reorders the flat data — so after softmax,
+   `acc_S[i]` no longer has the probability for the (m,n) that `tScS[i]` describes.
+2. Apply softmax through flat iteration instead of the M,N view. This requires reimplementing the
+   per-row softmax to work with the flat element order (grouping by M-row), which is complex but
+   correct.
+3. Build the identity mapping into an rmem tensor using `make_rmem_tensor(acc_S.shape, ...)` and
+   flat-fill from `tScS`, then apply `reshape_acc_to_mn` — but this was tried and did not resolve
+   the issue, suggesting `make_rmem_tensor(shape)` does not always produce the same layout as the
+   WGMMA accumulator.
+
+**Option B: Increase D_PACKED so WGMMA P@V works.**
+
+Pack more heads: `G=32, D_PACKED=64` (32 heads × 2 dims). This makes the V tile `[TILE_N, 64]`
+which is large enough for `transpose_view` to preserve the swizzle. The Q_sel selector pattern would
+have 62 zeros and 2 nonzero values per row (more waste). Requires `num_heads % 32 == 0`.
+
+**Option C: Chunked P@V WGMMA.**
+
+Instead of one PV GEMM over the full K dimension, iterate in chunks of D_PACKED=16:
+`V_chunk[16,16] @ P_chunk[64,16]^T` per chunk using the standard QK-style WGMMA (both operands
+from smem, K=16). This avoids the transpose_view issue entirely since both dimensions are 16. Sum
+the partial results across chunks.
+
+**Option D: Warp-shuffle P@V.**
+
+After WGMMA scores and softmax, use warp shuffles (like hull_attn2) for the P@V step. Each thread
+already has its probability values in registers. Broadcast V values across the warp via shuffle and
+accumulate. This avoids shared memory entirely for P@V.
+
+### Recommendation
+
+**Option D (warp-shuffle P@V)** is the most pragmatic path. The P@V with `head_dim=2` is only 2
+multiply-adds per key per row — warp shuffles handle this naturally, and hull_attn2 already proves
+the pattern works. The WGMMA handles the expensive part (QK scores), and shuffles handle the cheap
+part (P@V).
+
+Option A is worth trying if the layout mismatch can be fully understood, but the CuTe DSL's
+accumulator layout is not well-documented and debugging it is slow.
+
+Option C is clean but adds complexity (chunked accumulation with partial sums).
+
+Option B changes the packing factor which has cascading effects.
+
+
+## Open Questions
+
+1. ~~Should selector-packed Q be built in registers or staged in shared memory?~~
+   **Answered:** Shared memory works. Writing Q_sel to WGMMA-swizzled smem with runtime indices
+   via CuTe tensor indexing is correct (verified by diagnostic tests showing correct QK scores).
+2. Is `G = 8` the best group size, or is a larger synthetic width worthwhile?
+3. Should one CTA own one head group, or multiple head groups when sequence tiles are small?
+4. ~~Is there a clean way to reuse FA4 load/store helpers without inheriting too much generic logic?~~
+   **Answered:** FA4's `copy_utils.tma_get_copy_fn` and `tma_producer_copy_fn` work directly.
+   FA4's `Softmax` class works directly. FA4's `pipeline.PipelineTmaAsync` works directly.
+   The main incompatibility is with `transpose_view` for the PV WGMMA B-operand at small D_PACKED.
+5. **New:** What is the exact flat-to-logical mapping of `make_rmem_tensor(partition_shape_C(...))`
+   versus `partition_C(identity_tensor)`? Are their strides guaranteed equal?
+6. **New:** Can `online_softmax` be made to work with flat iteration order instead of `reshape_acc_to_mn`?
+
+
 ## Recommendation
 
-Pursue this plan only as a **new experimental path**, not as a direct mutation of the current
-scalar dim-2 kernel.
+Pursue **warp-shuffle P@V** (Option D) as the next step. The WGMMA QK + softmax infrastructure is
+working. Replace only the `scalar_pv` method with a shuffle-based accumulation that reads V from
+global memory and broadcasts across warp lanes — same pattern as `hull_attn2.py` lines 92-140.
 
-The best first milestone is:
-
-- grouped-head WGMMA for forward `QK`
-- scalar online softmax
-- scalar output accumulation
-- dense full attention only
-
-If that does not beat the current scalar kernel meaningfully, stop there. If it does, extend the
-same packing idea to backward score recompute.
+If that closes the correctness gap, benchmark against the existing scalar kernels on
+`[64, 64, 2048, 2]` to determine whether the WGMMA QK step provides a meaningful speedup.
