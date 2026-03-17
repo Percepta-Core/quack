@@ -10,22 +10,22 @@ QuACK (Quirky Assortment of CuTe Kernels) — high-performance CUDA kernels writ
 
 ```bash
 # Install (dev)
-pip install -e '.[dev]'
+uv pip install -e '.[dev]'
 pre-commit install
 
 # For CUDA 13.1
-pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
+uv pip install -e '.[dev,cu13]' --extra-index-url https://download.pytorch.org/whl/cu130
 
 # Lint & format
-ruff check --fix quack/ tests/
-ruff format quack/ tests/
+uv run ruff check --fix quack/ tests/
+uv run ruff format quack/ tests/
 
 # Run all tests
-pytest tests/
+uv run pytest tests/
 
 # Run a single test
-pytest tests/test_rmsnorm.py -x
-pytest tests/test_rmsnorm.py::test_rmsnorm_fwd -x -k "bfloat16"
+uv run pytest tests/test_rmsnorm.py -x
+uv run pytest tests/test_rmsnorm.py::test_rmsnorm_fwd -x -k "bfloat16"
 ```
 
 ## CuTe DSL Conventions
