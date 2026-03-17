@@ -85,7 +85,7 @@ Width-matched comparison: hull attention at `[64, 64, 2048, 2]` vs SDPA/FA4 at `
 | hull_attn3 | 66.81 ms | 576 MiB |
 | hull_attn | 82.48 ms | 576 MiB |
 
-The best hull kernels (hull_attn2, hull_attn_codex) match SDPA on 2d inputs for forward and beat it on backward, while using **4–5x less memory**. The gap to the 16d baselines reflects the overhead of many tiny heads vs fewer large heads.
+The best hull kernels (hull_attn2, hull_attn_codex) are still **12–13x slower** than FA4 on the equivalent 16d shape forward, and **5–6x slower** backward vs SDPA 16d. They do use less memory than SDPA on 2d inputs (576 vs 3136 MiB backward). Work in progress.
 
 ## Development
 
